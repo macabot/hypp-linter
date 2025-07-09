@@ -7,6 +7,7 @@ func main() {
 		"class": "foo",                             // ok
 		"style": map[string]string{"color": "red"}, // ok
 		"id":    "my-id",                           // ok
+		"key":   123,                               // ok
 		"onclick": func(s any, p any) any {
 			return s
 		}, // ok

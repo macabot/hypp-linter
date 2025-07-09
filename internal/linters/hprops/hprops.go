@@ -63,7 +63,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 func validateHProp(key string, valueType types.Type) error {
 	key = key[1 : len(key)-1] // remove quotes
 
-	if len(key) >= 2 && key[0] == 'o' && key[1] == 'n' {
+	if key == "key" {
+		return nil // The 'key' prop can be any type.
+	} else if len(key) >= 2 && key[0] == 'o' && key[1] == 'n' {
 		// Cannot properly check for dispatchable here, this is a limitation.
 	} else if key == "class" {
 		switch valueType.Underlying().(type) {
