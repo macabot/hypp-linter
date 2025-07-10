@@ -3,18 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
-	"go/ast"
 	"go/token"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/macabot/hypp-linter/internal/linters/dispatch"
 	"github.com/macabot/hypp-linter/internal/linters/hprops"
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
+	"go.uber.org/zap"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/packages"
 )
@@ -28,16 +27,33 @@ var analyzerPlugins = []*analysis.Analyzer{
 
 func main() {
 	ctx := context.Background()
-	conn := jsonrpc2.NewConn(jsonrpc2.NewStream(stdrwc{}))
-	server := protocol.NewServer(conn, &handler{server: protocol.NewServer(conn, nil)}) // Pass server to handler
+	logger, _ := zap.NewDevelopment()
 
-	if err := server.Run(ctx); err != nil {
-		log.Fatal(err)
+	stream := jsonrpc2.NewStream(stdrwc{})
+	conn := jsonrpc2.NewConn(stream)
+	client := protocol.ClientDispatcher(conn, logger.Named("client"))
+
+	// Create a default server implementation that handles all LSP methods as no-ops.
+	// We will embed this in our handler to satisfy the protocol.Server interface.
+	defaultServer := protocol.ServerDispatcher(conn, logger.Named("server"))
+
+	handler := &handler{
+		Server: defaultServer, // Embed the default server implementation
+		client: client,
 	}
+
+	conn.Go(ctx, protocol.ServerHandler(handler, jsonrpc2.MethodNotFoundHandler))
+
+	// Wait for the connection to close
+	<-conn.Done()
+	log.Println("Connection closed.")
 }
 
+// handler implements the protocol.Server interface by embedding a default server
+// and providing custom implementations for the methods we care about.
 type handler struct {
-	server protocol.Server
+	protocol.Server // Embed the default server implementation
+	client protocol.Client
 }
 
 func (h *handler) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
@@ -59,8 +75,6 @@ func (h *handler) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocum
 }
 
 func (h *handler) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
-	// The text document change notification supports incremental changes,
-	// but we simplify by re-linting the entire document content.
 	return h.lint(ctx, params.TextDocument.URI)
 }
 
@@ -69,8 +83,8 @@ func (h *handler) DidSave(ctx context.Context, params *protocol.DidSaveTextDocum
 }
 
 // lint runs the analyzers on the given file and publishes the diagnostics.
-func (h *handler) lint(ctx context.Context, uri protocol.DocumentURI) error {
-	filePath, err := uriToPath(uri)
+func (h *handler) lint(ctx context.Context, fileURI protocol.DocumentURI) error {
+	filePath, err := uriToPath(fileURI)
 	if err != nil {
 		return err
 	}
@@ -91,7 +105,7 @@ func (h *handler) lint(ctx context.Context, uri protocol.DocumentURI) error {
 		Fset:    token.NewFileSet(),
 	}
 
-	pkgs, err := packages.Load(cfg, filePath)
+	pkgs, err := packages.Load(cfg, "file="+filePath)
 	if err != nil {
 		return fmt.Errorf("failed to load packages: %w", err)
 	}
@@ -114,8 +128,8 @@ func (h *handler) lint(ctx context.Context, uri protocol.DocumentURI) error {
 				}
 
 				lspDiag := toLSPDiagnostic(diag, file)
-				uri := protocol.URIFromPath(file.Name())
-				allDiagnostics[uri] = append(allDiagnostics[uri], lspDiag)
+				uri := uri.File(file.Name())
+				allDiagnostics[protocol.DocumentURI(uri)] = append(allDiagnostics[protocol.DocumentURI(uri)], lspDiag)
 			}
 		}
 	}
@@ -123,14 +137,13 @@ func (h *handler) lint(ctx context.Context, uri protocol.DocumentURI) error {
 	// Clear previous diagnostics and publish new ones
 	for _, pkg := range pkgs {
 		for _, file := range pkg.GoFiles {
-			uri := protocol.URIFromPath(file)
-			// If a file has diagnostics, publish them. Otherwise, publish an empty slice to clear old diagnostics.
-			diags, ok := allDiagnostics[uri]
+			uri := uri.File(file)
+			diags, ok := allDiagnostics[protocol.DocumentURI(uri)]
 			if !ok {
 				diags = []protocol.Diagnostic{}
 			}
-			h.server.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
-				URI:         uri,
+			h.client.PublishDiagnostics(ctx, &protocol.PublishDiagnosticsParams{
+				URI:         protocol.DocumentURI(uri),
 				Diagnostics: diags,
 			})
 		}
@@ -141,6 +154,7 @@ func (h *handler) lint(ctx context.Context, uri protocol.DocumentURI) error {
 
 // runAnalyzer runs a single analyzer on a package.
 func runAnalyzer(analyzer *analysis.Analyzer, pkg *packages.Package) ([]analysis.Diagnostic, error) {
+	var diagnostics []analysis.Diagnostic
 	pass := &analysis.Pass{
 		Analyzer:   analyzer,
 		Fset:       pkg.Fset,
@@ -150,34 +164,11 @@ func runAnalyzer(analyzer *analysis.Analyzer, pkg *packages.Package) ([]analysis
 		TypesSizes: pkg.TypesSizes,
 		ResultOf:   map[*analysis.Analyzer]interface{}{},
 		Report: func(d analysis.Diagnostic) {
-			// This function is called by the analyzer to report a diagnostic.
-			// We will collect these diagnostics and return them.
+			diagnostics = append(diagnostics, d)
 		},
 	}
 
-	// This is a simplified run. A real implementation would handle dependencies between analyzers.
-	results, err := analyzer.Run(pass)
-	if err != nil {
-		return nil, err
-	}
-
-	// The analysis.Pass.Report function is not straightforward to capture.
-	// A common pattern is to have the analyzer return the diagnostics.
-	// Since the default analyzers we have don't do that, we need a workaround.
-	// For now, we assume the analyzer returns diagnostics as its result.
-	// This will need to be adjusted if analyzers use pass.Report.
-	if diags, ok := results.([]analysis.Diagnostic); ok {
-		return diags, nil
-	}
-
-	// A more robust way is to wrap the analyzer run and capture reported diagnostics,
-	// but that is more complex. We'll stick to a simpler model for now.
-	// Let's modify the pass.Report function to capture diagnostics.
-	var diagnostics []analysis.Diagnostic
-	pass.Report = func(d analysis.Diagnostic) {
-		diagnostics = append(diagnostics, d)
-	}
-	_, err = analyzer.Run(pass)
+	_, err := analyzer.Run(pass)
 	if err != nil {
 		return nil, err
 	}
@@ -205,11 +196,12 @@ func toLSPDiagnostic(diag analysis.Diagnostic, file *token.File) protocol.Diagno
 }
 
 // uriToPath converts a document URI to a file path.
-func uriToPath(uri protocol.DocumentURI) (string, error) {
-	if !strings.HasPrefix(string(uri), "file://") {
-		return "", fmt.Errorf("not a file URI: %s", uri)
+func uriToPath(docURI protocol.DocumentURI) (string, error) {
+	u, err := uri.Parse(string(docURI))
+	if err != nil {
+		return "", err
 	}
-	return strings.TrimPrefix(string(uri), "file://"), nil
+	return u.Filename(), nil
 }
 
 // stdrwc is a struct that implements the io.ReadWriteCloser interface.
